@@ -1,18 +1,22 @@
 const express = require('express');
 const cors = require('cors');
-const { DefaultAzureCredential } = require('@azure/identity');
-const { SecretClient } = require('@azure/keyvault-secrets');
-const { 
-    AIProjectsClient,
-    DoneEvent,
-    ErrorEvent,
-    isOutputOfType,
-    MessageStreamEvent,
-    RunStreamEvent,
-    ToolUtility,
-} = require('@azure/ai-projects');
+const { initializeAI } = require('./utils/initializeAI');
+const chatRoutes = require('./routes/chatRoutes');
+const fileRoutes = require('./routes/fileRoutes');
+const documentRoutes = require('./routes/documentRoutes');
 require('dotenv').config();
+// The safe way to set up logging
+const originalConsole = console;
 
+const logger = {
+    log: (...args) => originalConsole.log(new Date().toISOString(), '🔵', ...args),
+    error: (...args) => originalConsole.error(new Date().toISOString(), '🔴', ...args),
+    info: (...args) => originalConsole.info(new Date().toISOString(), '✨', ...args),
+    warn: (...args) => originalConsole.warn(new Date().toISOString(), '⚠️', ...args)
+};
+
+// Now safe to assign
+global.console = logger;
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -20,137 +24,94 @@ const PORT = process.env.PORT || 5000;
 app.use(express.json());
 app.use(cors());
 
-// Azure Key Vault Configuration
-const keyVaultName = process.env.KEYVAULT_NAME;
-const keyVaultUrl = `https://${keyVaultName}.vault.azure.net`;
-const credential = new DefaultAzureCredential();
-const secretClient = new SecretClient(keyVaultUrl, credential);
+// Health check endpoint
+app.get('/health', async (req, res) => {
+    const { getAgents } = require('./utils/initializeAI');
+    const agents = getAgents();
+    
+    if (agents && Object.values(agents).every(agent => agent !== null)) {
+        res.status(200).json({ 
+            status: 'healthy', 
+            aiStatus: 'initialized',
+            agents: Object.keys(agents)
+        });
+    } else {
+        res.status(503).json({ 
+            status: 'unhealthy', 
+            aiStatus: 'not initialized' 
+        });
+    }
+});
 
-// AI Projects Configuration
-let AI_CONNECTION_STRING = '';
-let aiProjectsClient = null;
-let agent = null;
+// Debug endpoint
+app.get('/debug', (req, res) => {
+    const { getClient, getAgents } = require('./utils/initializeAI');
+    const client = getClient();
+    const agents = getAgents();
+    
+    res.json({
+        hasClient: !!client,
+        agents: Object.keys(agents).reduce((acc, key) => {
+            acc[key] = !!agents[key];
+            return acc;
+        }, {})
+    });
+});
 
-// Retrieve AI Connection String from Key Vault and initialize client
-async function initializeAI() {
+// Initialize AI and start server
+async function startServer() {
     try {
-        // Get connection string from Key Vault
-        const secret = await secretClient.getSecret('AIConnectionString');
-        AI_CONNECTION_STRING = secret.value;
+        // Initialize AI
+        console.log('🚀 Starting AI initialization...');
+        await initializeAI(app);
+        console.log('✅ AI initialization complete');
 
-        // Initialize AI Projects Client
-        aiProjectsClient = AIProjectsClient.fromConnectionString(
-            AI_CONNECTION_STRING,
-            new DefaultAzureCredential()
-        );
+        // Move routes inside AI initialization block
+        app.use('/chat', chatRoutes);
+        app.use('/upload', fileRoutes);
+        app.use('/documents', documentRoutes); // Move here
 
-        // Create code interpreter tool
-        const codeInterpreterTool = ToolUtility.createCodeInterpreterTool();
-
-        // Create agent
-        agent = await aiProjectsClient.agents.createAgent("gpt-4o-mini", {
-            name: "chat-agent",
-            instructions: "You are a helpful AI assistant that provides clear and concise responses.",
-            tools: [codeInterpreterTool.definition],
-            toolResources: codeInterpreterTool.resources,
+        // Error handling middleware
+        app.use((err, req, res, next) => {
+            console.error('🔴 Error:', err);
+            res.status(500).json({ error: 'Internal server error' });
         });
 
-        console.log('AI initialization completed successfully');
+        // Start server
+        app.listen(PORT, () => {
+            console.log(`🟢 Server running on port ${PORT}`);
+        });
+
     } catch (error) {
-        console.error('Error initializing AI:', error);
-        throw error;
+        console.error('🔴 Failed to initialize AI:', error);
+        process.exit(1);
     }
 }
 
-// Initialize AI on startup
-initializeAI().catch(console.error);
-
-// Chat Route
-app.post('/chat', async (req, res) => {
+// Graceful shutdown handling
+const shutdown = async (signal) => {
+    console.log(`🔵 ${signal} received. Initiating shutdown...`);
     try {
-        const { userMessage } = req.body;
-        
-        if (!userMessage) {
-            return res.status(400).json({ error: 'User message is required' });
-        }
+        const { getClient, getAgents } = require('./utils/initializeAI');
+        const client = getClient();
+        const agents = getAgents();
 
-        if (!aiProjectsClient || !agent) {
-            return res.status(503).json({ error: 'AI service not initialized' });
-        }
-
-        // Create a new thread for this conversation
-        const thread = await aiProjectsClient.agents.createThread();
-
-        // Add user message to thread
-        await aiProjectsClient.agents.createMessage(thread.id, {
-            role: "user",
-            content: userMessage,
-        });
-
-        // Create response stream
-        const streamEventMessages = await aiProjectsClient.agents.createRun(thread.id, agent.id).stream();
-        
-        let aiResponse = '';
-
-        // Process stream events
-        for await (const eventMessage of streamEventMessages) {
-            switch (eventMessage.event) {
-                case MessageStreamEvent.ThreadMessageDelta: {
-                    const messageDelta = eventMessage.data;
-                    messageDelta.delta.content.forEach((contentPart) => {
-                        if (contentPart.type === "text") {
-                            aiResponse += contentPart.text?.value || '';
-                        }
-                    });
-                    break;
+        if (client && agents) {
+            for (const [name, agent] of Object.entries(agents)) {
+                if (agent) {
+                    await client.agents.deleteAgent(agent.id);
+                    console.log(`🗑️ ${name} cleaned up successfully`);
                 }
-                case ErrorEvent.Error:
-                    console.error(`Stream error: ${eventMessage.data}`);
-                    break;
-                case DoneEvent.Done:
-                    // Send the complete response
-                    return res.json({ aiResponse });
             }
         }
-
     } catch (error) {
-        console.error('Error in chat endpoint:', error);
-        res.status(500).json({ error: 'Failed to process chat request' });
-    }
-});
-
-// Cleanup endpoint (optional, for development)
-app.post('/cleanup', async (req, res) => {
-    try {
-        if (agent && aiProjectsClient) {
-            await aiProjectsClient.agents.deleteAgent(agent.id);
-            console.log('Agent cleaned up successfully');
-        }
-        res.json({ message: 'Cleanup completed' });
-    } catch (error) {
-        console.error('Cleanup error:', error);
-        res.status(500).json({ error: 'Cleanup failed' });
-    }
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).json({ error: 'Something broke!' });
-});
-
-// Start Server
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-    try {
-        if (agent && aiProjectsClient) {
-            await aiProjectsClient.agents.deleteAgent(agent.id);
-            console.log('Agent cleaned up during shutdown');
-        }
-    } catch (error) {
-        console.error('Error during shutdown:', error);
+        console.error('❌ Error during AI cleanup:', error);
     }
     process.exit(0);
-});
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Start the application
+startServer();
