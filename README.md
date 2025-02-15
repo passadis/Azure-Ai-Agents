@@ -42,8 +42,6 @@ The Azure AI Agent Service is a fully managed platform that enables developers t
      ```env
        KEYVAULT_NAME
        ....
-     ```
-   ```
 
 ## Resources
 - [Azure AI Agent Service Documentation](https://learn.microsoft.com/en-us/azure/ai-services/agents/overview)
